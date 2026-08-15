@@ -236,6 +236,10 @@ class QABoundaryTests(unittest.TestCase):
         server = MarkerServer(ROOT, head)
         try:
             static = VERIFY.verify(server.url, head, ROOT)
+            for route, expected_title in VERIFY.ROUTE_TITLES.items():
+                with self.subTest(route=route):
+                    self.assertTrue(VERIFY.exact_route_title(expected_title, expected_title))
+                    self.assertFalse(VERIFY.exact_route_title(f"{expected_title} stale", expected_title))
             browser = VERIFY.run_browser(
                 server.url,
                 set(static["precache_paths"]),

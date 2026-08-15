@@ -47,7 +47,16 @@ MANIFEST_KEYS = {
     "action", "origin", "new_note_url",
 }
 ROUTES = ("support/", "privacy/", "")
-ROUTE_TITLES = {"": "Pulsebreak", "support/": "Support", "privacy/": "Privacy"}
+ROUTE_TITLES = {
+    "": "Pulsebreak",
+    "support/": "Pulsebreak Support",
+    "privacy/": "Pulsebreak Privacy Policy",
+}
+
+
+def exact_route_title(title: object, expected_title: str) -> bool:
+    """Require the complete route title, rejecting composite or suffix titles."""
+    return isinstance(title, str) and title == expected_title
 
 # A bounded post-load async contract: every route remains under observation for
 # two seconds after load, covering deferred application and worker behavior
@@ -1079,7 +1088,7 @@ def run_browser(
             title = result.get("value")
             probe.route["title"] = title
             expected_title = ROUTE_TITLES[route]
-            if not isinstance(title, str) or expected_title not in title:
+            if not exact_route_title(title, expected_title):
                 probe._add("page_errors", f"unexpected document title: {title!r}")
             probe.finish_route()
 
@@ -1132,7 +1141,7 @@ def run_browser(
                     title = result.get("value")
                     offline_probe.route["title"] = title
                     expected_title = ROUTE_TITLES[route]
-                    if not isinstance(title, str) or expected_title not in title:
+                    if not exact_route_title(title, expected_title):
                         offline_probe._add("page_errors", f"unexpected offline document title: {title!r}")
                     offline_probe.finish_route()
             finally:
