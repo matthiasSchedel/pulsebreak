@@ -63,7 +63,7 @@ def write_fixture(
     app: str,
     css: str = "body { color: white; }",
     manifest_icon: str = "./icon.svg",
-    sw: str = 'const precacheAndRoute=()=>{};precacheAndRoute([{url:"index.html",revision:null}]);',
+    sw: str | None = None,
 ) -> None:
     (root / "support").mkdir(parents=True)
     (root / "privacy").mkdir(parents=True)
@@ -90,8 +90,25 @@ def write_fixture(
     )
     (root / "app.js").write_text(app)
     (root / "registerSW.js").write_text("navigator.serviceWorker.register('./sw.js');\n")
+    if sw is None:
+        sw = (
+            'const precacheAndRoute=()=>{};precacheAndRoute(['
+            '{url:"registerSW.js",revision:null},'
+            '{url:"manifest.webmanifest",revision:null},'
+            '{url:"index.html",revision:null},'
+            '{url:"icon.svg",revision:null},'
+            '{url:"support/index.html",revision:null},'
+            '{url:"privacy/index.html",revision:null},'
+            '{url:"style.css",revision:null},'
+            '{url:"app.js",revision:null}]);'
+        )
     (root / "sw.js").write_text(sw)
     (root / "workbox.js").write_text("\n")
+
+
+def track_fixture(root: pathlib.Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
 
 
 class QABoundaryTests(unittest.TestCase):
@@ -151,6 +168,69 @@ class QABoundaryTests(unittest.TestCase):
                 finally:
                     server.close()
 
+    def test_static_graph_rejects_source_mapping_directive_and_orphan_map(self) -> None:
+        hostile_cases = (
+            ("directive", "//# sourceMappingURL=app.js.map\n"),
+            ("orphan", "void 0;\n"),
+        )
+        for label, app in hostile_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="pulsebreak-source-map-hostile-") as temporary:
+                root = pathlib.Path(temporary)
+                write_fixture(root, app)
+                (root / "app.js.map").write_text("{\"version\":3,\"sources\":[]}")
+                track_fixture(root)
+                server = MarkerServer(root, "a" * 40)
+                try:
+                    with self.assertRaises(AssertionError):
+                        VERIFY.verify(server.url, "a" * 40, root)
+                finally:
+                    server.close()
+
+    def test_static_graph_rejects_root_absolute_pwa_and_runtime_references(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-root-absolute-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(root, "void 0;")
+            (root / "index.html").write_text(
+                (root / "index.html").read_text()
+                .replace("./icon.svg", "/icon.svg")
+                .replace("./style.css", "/style.css")
+                .replace("./manifest.webmanifest", "/manifest.webmanifest")
+                .replace("./app.js", "/app.js")
+                .replace("./registerSW.js", "/registerSW.js")
+            )
+            (root / "manifest.webmanifest").write_text(
+                (root / "manifest.webmanifest").read_text()
+                .replace("./", "/")
+                .replace("./icon.svg", "/icon.svg")
+            )
+            (root / "registerSW.js").write_text(
+                "navigator.serviceWorker.register('/sw.js');\n"
+            )
+            (root / "sw.js").write_text(
+                (root / "sw.js").read_text().replace('url:"', 'url:"/')
+            )
+            server = MarkerServer(root, "a" * 40)
+            try:
+                with self.assertRaises(AssertionError):
+                    VERIFY.verify(server.url, "a" * 40)
+            finally:
+                server.close()
+
+    def test_static_graph_rejects_incomplete_offline_precache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-precache-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(
+                root,
+                "void 0;",
+                sw='const precacheAndRoute=()=>{};precacheAndRoute([{url:"index.html",revision:null}]);',
+            )
+            server = MarkerServer(root, "a" * 40)
+            try:
+                with self.assertRaises(AssertionError):
+                    VERIFY.verify(server.url, "a" * 40)
+            finally:
+                server.close()
+
     def test_browser_rejects_loaded_runtime_exception(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-hostile-") as temporary:
             root = pathlib.Path(temporary)
@@ -175,13 +255,40 @@ class QABoundaryTests(unittest.TestCase):
             finally:
                 server.close()
 
-    def test_browser_rejects_service_worker_runtime_exception(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="pulsebreak-worker-hostile-") as temporary:
+    def test_browser_rejects_delayed_runtime_exception(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-delayed-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(root, "setTimeout(() => { throw new Error('delayed fixture failure'); }, 1200);\n")
+            server = MarkerServer(root, "a" * 40)
+            try:
+                VERIFY.verify(server.url, "a" * 40)
+                with self.assertRaises(AssertionError):
+                    VERIFY.run_browser(server.url)
+            finally:
+                server.close()
+
+    def test_browser_rejects_delayed_computed_cross_origin_fetch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-delayed-origin-") as temporary:
             root = pathlib.Path(temporary)
             write_fixture(
                 root,
-                "void 0;\n",
-                sw="const precacheAndRoute=()=>{};precacheAndRoute([{url:\"index.html\",revision:null}]);self.addEventListener('install',()=>{throw new Error('worker failure')});\n",
+                "setTimeout(() => fetch(new Request(location.protocol + '//tracker.invalid/pixel')), 1200);\n",
+            )
+            server = MarkerServer(root, "a" * 40)
+            try:
+                VERIFY.verify(server.url, "a" * 40)
+                with self.assertRaises(AssertionError):
+                    VERIFY.run_browser(server.url)
+            finally:
+                server.close()
+
+    def test_browser_rejects_service_worker_runtime_exception(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-worker-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(root, "void 0;\n")
+            (root / "sw.js").write_text(
+                (root / "sw.js").read_text()
+                + "self.addEventListener('install',()=>{throw new Error('worker failure')});\n"
             )
             server = MarkerServer(root, "a" * 40)
             try:

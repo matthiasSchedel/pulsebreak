@@ -17,6 +17,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ import urllib.request
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CSS_URL = re.compile(r"url\(\s*([\"']?)([^\"')]+?)\1\s*\)", re.IGNORECASE)
 PRECACHE_ENTRY = re.compile(r"\{url:\"([^\"]+)\",revision:(null|\"([^\"]+)\")\}")
+SOURCE_MAPPING_DIRECTIVE = re.compile(rb"(?i)sourceMappingURL\s*[:=]")
 JS_REFERENCE_PATTERNS = (
     ("runtime", re.compile(r"\b(?:fetch|importScripts|import|sendBeacon|register)\s*\(\s*([\"'`])([^\"'`]+)\1")),
     ("module", re.compile(r"\bdefine\s*\(\s*\[\s*([\"'`])([^\"'`]+)\1")),
@@ -41,6 +43,21 @@ MANIFEST_KEYS = {
 }
 ROUTES = ("support/", "privacy/", "")
 ROUTE_TITLES = {"": "Pulsebreak", "support/": "Support", "privacy/": "Privacy"}
+
+# A bounded post-load async contract: every route remains under observation for
+# two seconds after load, covering deferred application and worker behavior
+# without leaving CI with an unbounded browser session.
+RUNTIME_OBSERVATION_CONTRACT = "bounded-post-load-async-window-v1"
+RUNTIME_OBSERVATION_WINDOW_SECONDS = 2.0
+
+# These scripts bootstrap the worker itself. They are fetched by the browser
+# during worker installation and are intentionally excluded from the offline
+# application graph; every other discovered public resource must be precached.
+WORKER_BOOTSTRAP_INVARIANT = "sw.js and workbox-*.js are install-time worker bootstrap files"
+
+
+def is_worker_bootstrap(path: str) -> bool:
+    return path == "sw.js" or (path.startswith("workbox-") and path.endswith(".js"))
 
 
 class References(HTMLParser):
@@ -67,6 +84,65 @@ def same_origin(url: str, origin: urllib.parse.SplitResult) -> bool:
 
 def ignorable_reference(reference: str) -> bool:
     return reference.startswith(("#", "mailto:", "tel:", "data:", "blob:"))
+
+
+def reference_boundary_error(reference: str, tag: str) -> str | None:
+    """Return an error for a non-relative runtime/PWA reference.
+
+    External navigation anchors remain valid links. Every other public graph
+    edge must be relative so the Pages artifact cannot silently escape its
+    loopback origin or bypass the offline graph.
+    """
+    parsed = urllib.parse.urlsplit(reference)
+    if tag == "a" and (reference.startswith("//") or parsed.scheme in {"http", "https"}):
+        return None
+    if reference.startswith("/") or reference.startswith("//") or parsed.scheme:
+        return f"non-relative {tag} reference: {reference}"
+    return None
+
+
+def artifact_path(relative: str) -> str:
+    """Map a fetched route to the published file covered by precache."""
+    path = relative.strip("/")
+    if not path:
+        return "index.html"
+    if relative.endswith("/"):
+        return f"{path}/index.html"
+    return path
+
+
+def tracked_public_tree_failures(repo: pathlib.Path) -> list[str]:
+    """Reject maps/directives anywhere in the tracked published tree."""
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "-z"], cwd=repo, check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        return [f"cannot enumerate tracked public tree: {type(error).__name__}"]
+    failures: list[str] = []
+    for raw_path in result.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = raw_path.decode("utf-8", errors="surrogateescape")
+        # QA and workflow sources are not shipped by the Pages artifact.
+        if relative.startswith((".qa/", ".github/")):
+            continue
+        if relative.lower().endswith(".map"):
+            failures.append(f"published source map is forbidden: {relative}")
+        path = repo / pathlib.PurePosixPath(relative)
+        try:
+            mode = path.lstat().st_mode
+            if not stat.S_ISREG(mode):
+                failures.append(f"published tree entry is not a regular file: {relative}")
+                continue
+            body = path.read_bytes()
+        except OSError as error:
+            failures.append(f"published tree entry unreadable: {relative} ({type(error).__name__})")
+            continue
+        if SOURCE_MAPPING_DIRECTIVE.search(body):
+            failures.append(f"published sourceMappingURL directive is forbidden: {relative}")
+    return failures
 
 
 def manifest_references(value: object, key: str = "") -> list[str]:
@@ -97,11 +173,13 @@ def precache_entries(text: str) -> list[tuple[str, str | None]]:
     return [(match.group(1), None if match.group(2) == "null" else match.group(3)) for match in PRECACHE_ENTRY.finditer(text)]
 
 
-def verify(base_url: str, head: str) -> dict[str, object]:
+def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[str, object]:
     base = base_url.rstrip("/") + "/"
     expected_origin = urllib.parse.urlsplit(base)
     checked: dict[str, dict[str, object]] = {}
     failures: list[str] = []
+    if repo is not None:
+        failures.extend(tracked_public_tree_failures(repo.resolve(strict=True)))
     queue = ["", "support/", "privacy/", "icon.svg", "manifest.webmanifest", ".__pulsebreak_qa_head"]
     seen: set[str] = set()
     while queue:
@@ -147,6 +225,10 @@ def verify(base_url: str, head: str) -> dict[str, object]:
         for tag, reference in references:
             if ignorable_reference(reference):
                 continue
+            boundary_error = reference_boundary_error(reference, tag)
+            if boundary_error:
+                failures.append(boundary_error)
+                continue
             resolved_reference = reference
             if tag == "module" and reference == "exports":
                 continue
@@ -181,6 +263,10 @@ def verify(base_url: str, head: str) -> dict[str, object]:
     else:
         precached_paths: set[str] = set()
         for reference, revision in entries:
+            boundary_error = reference_boundary_error(reference, "precache")
+            if boundary_error:
+                failures.append(boundary_error)
+                continue
             target = urllib.parse.urljoin(base, reference)
             if not same_origin(target, expected_origin):
                 failures.append(f"cross-origin precache reference: {reference}")
@@ -197,11 +283,30 @@ def verify(base_url: str, head: str) -> dict[str, object]:
                 failures.append(f"precache response invalid: {reference} status={status} bytes={len(body)}")
             if revision and hashlib.md5(body).hexdigest() != revision:
                 failures.append(f"precache revision mismatch: {reference}")
+        offline_required_paths = {
+            artifact_path(path)
+            for path in checked
+            if path != ".__pulsebreak_qa_head" and not is_worker_bootstrap(path)
+        }
+        missing_paths = sorted(offline_required_paths - precached_paths)
+        for path in missing_paths:
+            failures.append(f"service-worker precache misses offline graph resource: {path}")
         if "index.html" not in precached_paths:
             failures.append("service-worker precache lacks index.html navigation fallback")
     if failures:
         raise AssertionError("; ".join(sorted(set(failures))))
-    return {"head": head, "base_url": base, "checked": checked, "cross_origin_dependencies": []}
+    return {
+        "head": head,
+        "base_url": base,
+        "checked": checked,
+        "offline_graph": sorted(
+            artifact_path(path)
+            for path in checked
+            if path != ".__pulsebreak_qa_head" and not is_worker_bootstrap(path)
+        ),
+        "worker_bootstrap_invariant": WORKER_BOOTSTRAP_INVARIANT,
+        "cross_origin_dependencies": [],
+    }
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -525,7 +630,7 @@ def run_browser(base_url: str) -> dict[str, object]:
                 probe._add("failed_requests", str((navigation.get("result") or {}).get("errorText")))
             if not receive_until(time.monotonic() + 15, load=True):
                 probe._add("page_errors", "load event timeout")
-            receive_until(time.monotonic() + 0.75)
+            receive_until(time.monotonic() + RUNTIME_OBSERVATION_WINDOW_SECONDS)
             evaluation = connection.command("Runtime.evaluate", {"expression": "document.title", "returnByValue": True})
             result = (evaluation.get("result") or {}).get("result") or {}
             if "exceptionDetails" in evaluation.get("result", {}):
@@ -550,6 +655,8 @@ def run_browser(base_url: str) -> dict[str, object]:
         return {
             "engine": pathlib.Path(chrome_binary()).name,
             "origin": f"{origin.scheme}://{origin.netloc}",
+            "observation_contract": RUNTIME_OBSERVATION_CONTRACT,
+            "observation_window_seconds": RUNTIME_OBSERVATION_WINDOW_SECONDS,
             "routes": probe.routes,
             "status": "PASS",
         }
@@ -574,6 +681,7 @@ def main() -> int:
     parser.add_argument("--head")
     args = parser.parse_args()
     try:
+        repo: pathlib.Path | None = None
         if args.ci:
             repo = pathlib.Path(args.repo or ".").resolve(strict=True)
             head = (args.head or "").lower()
@@ -594,9 +702,11 @@ def main() -> int:
             server = None
             if not preview_url.startswith("http://127.0.0.1:") or not SHA.fullmatch(head):
                 raise ValueError("QA environment is not exact-head local-slot input")
+            configured_repo = os.environ.get("QA_REPO", ".")
+            repo = pathlib.Path(configured_repo).resolve(strict=True)
             artifact_dir.resolve().mkdir(parents=True, exist_ok=True)
         try:
-            assertions = verify(preview_url, head)
+            assertions = verify(preview_url, head, repo)
             browser = run_browser(preview_url)
             assertions["browser"] = browser
         finally:
