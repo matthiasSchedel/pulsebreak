@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import contextlib
 import functools
 from html.parser import HTMLParser
@@ -381,6 +382,7 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
     base = base_url.rstrip("/") + "/"
     expected_origin = urllib.parse.urlsplit(base)
     checked: dict[str, dict[str, object]] = {}
+    artifact_digests: dict[str, str] = {}
     failures: list[str] = []
     if repo is not None:
         failures.extend(tracked_public_tree_failures(repo.resolve(strict=True)))
@@ -401,6 +403,10 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
             failures.append(f"request failed: {relative or '/'} ({type(error).__name__})")
             continue
         checked[relative or "/"] = {"status": status, "bytes": len(body), "content_type": content_type}
+        if body and status < 400:
+            normalized = artifact_path(relative)
+            if normalized != ".__pulsebreak_qa_head" and not is_worker_bootstrap(normalized):
+                artifact_digests.setdefault(normalized, hashlib.sha256(body).hexdigest())
         if status >= 400 or not body:
             failures.append(f"unexpected response: {relative or '/'} status={status} bytes={len(body)}")
             continue
@@ -462,10 +468,10 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
         entries = precache_entries(sw_body.decode("utf-8", errors="replace"))
     except (OSError, urllib.error.URLError):
         entries = []
+    precached_paths: set[str] = set()
     if not entries:
         failures.append("service-worker precache manifest missing")
     else:
-        precached_paths: set[str] = set()
         for reference, revision in entries:
             boundary_error = reference_boundary_error(reference, "precache")
             if boundary_error:
@@ -485,6 +491,8 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
                 continue
             if status != 200 or not body:
                 failures.append(f"precache response invalid: {reference} status={status} bytes={len(body)}")
+            if status == 200 and body:
+                artifact_digests.setdefault(target_relative, hashlib.sha256(body).hexdigest())
             if revision and hashlib.md5(body).hexdigest() != revision:
                 failures.append(f"precache revision mismatch: {reference}")
         offline_required_paths = {
@@ -509,6 +517,7 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
             if path != ".__pulsebreak_qa_head" and not is_worker_bootstrap(path)
         ),
         "precache_paths": sorted(precached_paths),
+        "artifact_digests": artifact_digests,
         "worker_bootstrap_invariant": WORKER_BOOTSTRAP_INVARIANT,
         "cross_origin_dependencies": [],
     }
@@ -849,7 +858,19 @@ def browser_cache_storage(connection: CDPConnection, origin: urllib.parse.SplitR
       const entries=[];
       for (const name of await caches.keys()) {
         const cache=await caches.open(name);
-        for (const request of await cache.keys()) entries.push({name,url:request.url});
+        for (const request of await cache.keys()) {
+          const response=await cache.match(request);
+          if (!response) {
+            entries.push({name,url:request.url,status:null,body:null,error:"response missing"});
+            continue;
+          }
+          const bytes=new Uint8Array(await response.arrayBuffer());
+          let binary="";
+          for(let offset=0;offset<bytes.length;offset+=0x8000){
+            binary+=String.fromCharCode(...bytes.subarray(offset,offset+0x8000));
+          }
+          entries.push({name,url:request.url,status:response.status,body:btoa(binary)});
+        }
       }
       return entries;
     })()"""
@@ -879,10 +900,78 @@ def browser_cache_storage(connection: CDPConnection, origin: urllib.parse.SplitR
             foreign.add(url)
             continue
         paths.add(artifact_path(parsed.path.lstrip("/")))
-    return {"cache_names": sorted(names), "paths": sorted(paths), "foreign_urls": sorted(foreign)}
+    return {
+        "cache_names": sorted(names),
+        "paths": sorted(paths),
+        "foreign_urls": sorted(foreign),
+        "entries": entries,
+    }
 
 
-def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[str, object]:
+def validate_cache_storage_responses(
+    cache_storage: dict[str, object],
+    origin: urllib.parse.SplitResult,
+    expected_paths: set[str],
+    expected_digests: dict[str, str],
+) -> None:
+    """Require one exact, successful cached Response for every static artifact."""
+    missing_digests = sorted(expected_paths - set(expected_digests))
+    if missing_digests:
+        raise AssertionError(
+            "service-worker Cache Storage has no static artifact digest for: "
+            + ", ".join(missing_digests)
+        )
+    entries = cache_storage.get("entries")
+    if not isinstance(entries, list):
+        raise AssertionError("service-worker Cache Storage response entries missing")
+    seen_paths: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise AssertionError("service-worker Cache Storage returned an ambiguous response entry")
+        url = entry.get("url")
+        if not isinstance(url, str) or not url:
+            raise AssertionError("service-worker Cache Storage response key missing")
+        if not same_origin(url, origin):
+            raise AssertionError(f"service-worker Cache Storage contains cross-origin entry: {url}")
+        path = artifact_path(urllib.parse.urlsplit(url).path.lstrip("/"))
+        if path not in expected_paths:
+            raise AssertionError(f"service-worker Cache Storage contains undeclared resource: {path}")
+        if path in seen_paths:
+            raise AssertionError(f"service-worker Cache Storage contains duplicate artifact key: {path}")
+        seen_paths.add(path)
+        status = entry.get("status")
+        if status != 200:
+            raise AssertionError(
+                f"service-worker Cache Storage response invalid: {path} status={status!r}"
+            )
+        encoded_body = entry.get("body")
+        if not isinstance(encoded_body, str):
+            raise AssertionError(f"service-worker Cache Storage response body missing: {path}")
+        try:
+            body = base64.b64decode(encoded_body, validate=True)
+        except (binascii.Error, TypeError, ValueError) as error:
+            raise AssertionError(
+                f"service-worker Cache Storage response body is not valid base64: {path}"
+            ) from error
+        digest = hashlib.sha256(body).hexdigest()
+        if digest != expected_digests[path]:
+            raise AssertionError(
+                f"service-worker Cache Storage response digest mismatch: {path} "
+                f"expected={expected_digests[path]} actual={digest}"
+            )
+    missing_paths = sorted(expected_paths - seen_paths)
+    if missing_paths:
+        raise AssertionError(
+            "service-worker Cache Storage response entries missing: "
+            + ", ".join(missing_paths)
+        )
+
+
+def run_browser(
+    base_url: str,
+    precache_paths: set[str] | None = None,
+    artifact_digests: dict[str, str] | None = None,
+) -> dict[str, object]:
     origin = urllib.parse.urlsplit(base_url.rstrip("/") + "/")
     port_socket = socket.socket()
     port_socket.bind(("127.0.0.1", 0))
@@ -1008,6 +1097,16 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
                     "installed service-worker Cache Storage misses declared precache resources: "
                     + ", ".join(missing_cached_paths)
                 )
+            if artifact_digests is None:
+                raise AssertionError(
+                    "service-worker Cache Storage exact static artifact digests required"
+                )
+            validate_cache_storage_responses(
+                cache_storage,
+                origin,
+                set(precache_paths),
+                {str(path): str(digest) for path, digest in artifact_digests.items()},
+            )
 
             offline_probe = RuntimeProbe(origin)
             active_probe = offline_probe
@@ -1023,6 +1122,18 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
                     loaded = receive_until(time.monotonic() + OFFLINE_RELOAD_TIMEOUT_SECONDS, load=True)
                     if not loaded:
                         offline_probe._add("page_errors", "offline reload timeout")
+                    evaluation = connection.command(
+                        "Runtime.evaluate",
+                        {"expression": "document.title", "returnByValue": True},
+                    )
+                    result = (evaluation.get("result") or {}).get("result") or {}
+                    if "exceptionDetails" in evaluation.get("result", {}):
+                        offline_probe._add("page_errors", "offline document.title evaluation failed")
+                    title = result.get("value")
+                    offline_probe.route["title"] = title
+                    expected_title = ROUTE_TITLES[route]
+                    if not isinstance(title, str) or expected_title not in title:
+                        offline_probe._add("page_errors", f"unexpected offline document title: {title!r}")
                     offline_probe.finish_route()
             finally:
                 emulate_network(False)
@@ -1032,6 +1143,7 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
                 offline_routes.append({
                     "route": route["route"],
                     "document_status": route.get("document_status"),
+                    "title": route.get("title"),
                     "loaded": not any(route.get(key) for key in ("failed_requests", "page_errors", "console_errors", "log_errors", "cross_origin_requests")),
                 })
                 if route.get("document_status") != 200:
@@ -1136,7 +1248,11 @@ def main() -> int:
         try:
             assertions = verify(preview_url, head, repo)
             precache_paths = {str(path) for path in assertions.get("precache_paths", [])}
-            browser = run_browser(preview_url, precache_paths)
+            artifact_digests = {
+                str(path): str(digest)
+                for path, digest in (assertions.get("artifact_digests") or {}).items()
+            }
+            browser = run_browser(preview_url, precache_paths, artifact_digests)
             merge_browser_offline_graph(assertions, browser)
             assertions["browser"] = browser
         finally:

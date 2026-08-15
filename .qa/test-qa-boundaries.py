@@ -145,6 +145,36 @@ def fixture_precache_worker(body: str) -> str:
     return f"const precacheAndRoute=()=>{{}};{body}"
 
 
+def stale_body_precache_worker() -> str:
+    stale_body = (
+        "<!doctype html><html><head><link rel=\"icon\" href=\"/icon.svg\">"
+        "<title>Pulsebreak Support Privacy</title></head>"
+        "<body>stale cached artifact</body></html>"
+    )
+    return (
+        'const precacheAndRoute=entries=>{'
+        'const cacheName="stale-precache";'
+        'self.addEventListener("install",event=>event.waitUntil('
+        'caches.open(cacheName).then(async cache=>{'
+        f'const staleBody={json.dumps(stale_body)};'
+        'await Promise.all(entries.map(entry=>cache.put('
+        'new Request(new URL(entry.url+"?__WB_REVISION__=stale",self.location)),'
+        'new Response(staleBody,{headers:{"Content-Type":"text/html"}}))));'
+        '}).then(()=>self.skipWaiting())));'
+        'self.addEventListener("activate",event=>event.waitUntil(self.clients.claim()));'
+        'self.addEventListener("fetch",event=>event.respondWith((async()=>{'
+        'const cache=await caches.open(cacheName);'
+        'const requestURL=new URL(event.request.url);'
+        'const candidates=[event.request];'
+        'if(requestURL.pathname.endsWith("/"))candidates.push('
+        'new Request(new URL(requestURL.pathname+"index.html",requestURL)));'
+        'if(event.request.mode!=="navigate")return fetch(event.request);'
+        'for(const request of candidates){const hit=await cache.match(request,{ignoreSearch:true});'
+        'if(hit)return hit;}return fetch(event.request);})()));};'
+        f'precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);'
+    )
+
+
 class QABoundaryTests(unittest.TestCase):
     def test_cdp_target_discovery_retries_delayed_page_target(self) -> None:
         class RunningProcess:
@@ -206,7 +236,11 @@ class QABoundaryTests(unittest.TestCase):
         server = MarkerServer(ROOT, head)
         try:
             static = VERIFY.verify(server.url, head, ROOT)
-            browser = VERIFY.run_browser(server.url, set(static["precache_paths"]))
+            browser = VERIFY.run_browser(
+                server.url,
+                set(static["precache_paths"]),
+                dict(static["artifact_digests"]),
+            )
             self.assertEqual(browser["status"], "PASS")
             self.assertTrue(browser["offline_routes"])
         finally:
@@ -420,7 +454,27 @@ class QABoundaryTests(unittest.TestCase):
             try:
                 static = VERIFY.verify(server.url, "a" * 40, root)
                 with self.assertRaisesRegex(AssertionError, "Cache Storage"):
-                    VERIFY.run_browser(server.url, set(static["precache_paths"]))
+                    VERIFY.run_browser(
+                        server.url,
+                        set(static["precache_paths"]),
+                        dict(static["artifact_digests"]),
+                    )
+            finally:
+                server.close()
+
+    def test_browser_rejects_identical_stale_html_for_every_precache_key(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-cache-stale-body-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(root, "void 0;", sw=stale_body_precache_worker())
+            server = MarkerServer(root, "a" * 40)
+            try:
+                static = VERIFY.verify(server.url, "a" * 40)
+                with self.assertRaisesRegex(AssertionError, "Cache Storage"):
+                    VERIFY.run_browser(
+                        server.url,
+                        set(static["precache_paths"]),
+                        dict(static["artifact_digests"]),
+                    )
             finally:
                 server.close()
 
@@ -586,7 +640,11 @@ class QABoundaryTests(unittest.TestCase):
             try:
                 static = VERIFY.verify(server.url, "a" * 40, root)
                 with self.assertRaises(AssertionError):
-                    VERIFY.run_browser(server.url, set(static["precache_paths"]))
+                    VERIFY.run_browser(
+                        server.url,
+                        set(static["precache_paths"]),
+                        dict(static["artifact_digests"]),
+                    )
             finally:
                 server.close()
 
@@ -603,7 +661,11 @@ class QABoundaryTests(unittest.TestCase):
             server = MarkerServer(root, "a" * 40)
             try:
                 static = VERIFY.verify(server.url, "a" * 40, root)
-                browser = VERIFY.run_browser(server.url, set(static["precache_paths"]))
+                browser = VERIFY.run_browser(
+                    server.url,
+                    set(static["precache_paths"]),
+                    dict(static["artifact_digests"]),
+                )
                 VERIFY.merge_browser_offline_graph(static, browser)
                 self.assertIn("late.json", browser["observed_offline_resources"])
                 self.assertIn("late.json", static["offline_graph"])
