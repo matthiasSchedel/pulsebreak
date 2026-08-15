@@ -38,7 +38,11 @@ JS_REFERENCE_PATTERNS = (
     ("runtime", re.compile(r"\b(?:src|href|url)\s*:\s*([\"'`])([^\"'`]+)\1")),
 )
 MANIFEST_KEYS = {
+    # Core manifest URLs plus URL-bearing members of the current Web App
+    # Manifest extensions. These values all control a fetch, navigation,
+    # handler, or scope and therefore must remain inside the published graph.
     "id", "scope", "service_worker", "serviceworker", "src", "start_url", "url",
+    "action", "origin", "new_note_url",
 }
 ROUTES = ("support/", "privacy/", "")
 ROUTE_TITLES = {"": "Pulsebreak", "support/": "Support", "privacy/": "Privacy"}
@@ -48,6 +52,8 @@ ROUTE_TITLES = {"": "Pulsebreak", "support/": "Support", "privacy/": "Privacy"}
 # without leaving CI with an unbounded browser session.
 RUNTIME_OBSERVATION_CONTRACT = "bounded-post-load-async-window-v1"
 RUNTIME_OBSERVATION_WINDOW_SECONDS = 2.0
+OFFLINE_RELOAD_CONTRACT = "installed-cache-storage-offline-reload-v1"
+OFFLINE_RELOAD_TIMEOUT_SECONDS = 8.0
 
 # These scripts bootstrap the worker itself. They are fetched by the browser
 # during worker installation and are intentionally excluded from the offline
@@ -284,17 +290,28 @@ def object_properties(tokens: list[tuple[str, str]], start: int, end: int) -> di
 
 
 def precache_entries(text: str) -> list[tuple[str, str | None]]:
-    """Extract entries from the executable precacheAndRoute array only."""
+    """Extract one deterministic executable precacheAndRoute array.
+
+    Workbox call selection is intentionally fail-closed. Static tokenization
+    cannot prove JavaScript reachability, so multiple calls, malformed calls,
+    and calls under control-flow operators are ambiguous and rejected. The
+    browser-side Cache Storage and offline probes below remain the effective
+    completeness authority.
+    """
     tokens = javascript_tokens(text)
+    candidates: list[list[tuple[str, str | None]]] = []
+    ambiguous = False
     for index in range(len(tokens) - 2):
         if tokens[index] != ("identifier", "precacheAndRoute") or tokens[index + 1][1] != "(":
             continue
         array_start = index + 2
         if tokens[array_start][1] != "[":
+            ambiguous = True
             continue
         array_end = matching_token(tokens, array_start, "[", "]")
         if array_end is None:
-            return []
+            ambiguous = True
+            continue
         entries: list[tuple[str, str | None]] = []
         cursor = array_start + 1
         while cursor < array_end:
@@ -303,7 +320,8 @@ def precache_entries(text: str) -> list[tuple[str, str | None]]:
                 continue
             object_end = matching_token(tokens, cursor, "{", "}")
             if object_end is None or object_end > array_end:
-                return []
+                ambiguous = True
+                break
             properties = object_properties(tokens, cursor, object_end)
             url = properties.get("url")
             revision = properties.get("revision")
@@ -311,8 +329,45 @@ def precache_entries(text: str) -> list[tuple[str, str | None]]:
                 revision_value = revision[1] if revision and revision[0] == "string" else None
                 entries.append((url[1], revision_value))
             cursor = object_end + 1
-        return entries
-    return []
+        candidates.append(entries)
+
+        # Find the nearest lexical block and its header. If the call is
+        # guarded by if/else/switch/loop/catch or a short-circuit/ternary
+        # expression, static analysis cannot establish that this is the
+        # installed Workbox call, so fail closed.
+        stack: list[tuple[str, int]] = []
+        pairs = {")": "(", "]": "[", "}": "{"}
+        for token_index in range(index):
+            value = tokens[token_index][1]
+            if value in "([{":
+                stack.append((value, token_index))
+            elif value in pairs:
+                for stack_index in range(len(stack) - 1, -1, -1):
+                    if stack[stack_index][0] == pairs[value]:
+                        del stack[stack_index:]
+                        break
+        block_start = max(
+            (token_index for opening, token_index in stack if opening == "{"),
+            default=-1,
+        )
+        statement_start = block_start + 1
+        for token_index in range(statement_start, index):
+            if tokens[token_index][1] == ";":
+                statement_start = token_index + 1
+        for token_index in range(statement_start, index):
+            value = tokens[token_index][1]
+            if value in {"if", "else", "switch", "for", "while", "catch", "?"}:
+                ambiguous = True
+            if value in {"&", "|"} and token_index + 1 < index and tokens[token_index + 1][1] == value:
+                ambiguous = True
+        header_start = block_start - 1
+        while header_start >= 0 and tokens[header_start][1] not in {";", "{", "}"}:
+            if tokens[header_start][1] in {"if", "else", "switch", "for", "while", "catch"}:
+                ambiguous = True
+            header_start -= 1
+    if ambiguous or len(candidates) != 1:
+        return []
+    return candidates[0]
 
 
 def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[str, object]:
@@ -683,6 +738,48 @@ def browser_json(port: int, path: str) -> object:
         return json.loads(response.read().decode())
 
 
+def browser_cache_storage(connection: CDPConnection, origin: urllib.parse.SplitResult) -> dict[str, object]:
+    """Read the installed service worker's Cache Storage through the page.
+
+    The static Workbox array is only a declaration. Cache Storage is the
+    browser-observed effective installation, so a declared entry that was
+    unreachable or conditionally skipped cannot satisfy completeness.
+    """
+    expression = """(async()=>{
+      const entries=[];
+      for (const name of await caches.keys()) {
+        const cache=await caches.open(name);
+        for (const request of await cache.keys()) entries.push({name,url:request.url});
+      }
+      return entries;
+    })()"""
+    evaluation = connection.command(
+        "Runtime.evaluate",
+        {"expression": expression, "awaitPromise": True, "returnByValue": True},
+    )
+    result = (evaluation.get("result") or {}).get("result") or {}
+    if "exceptionDetails" in evaluation.get("result", {}):
+        raise RuntimeError("Cache Storage evaluation failed")
+    entries = result.get("value")
+    if not isinstance(entries, list):
+        raise RuntimeError("Cache Storage returned no enumerable entries")
+    paths: set[str] = set()
+    foreign: set[str] = set()
+    names: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise RuntimeError("Cache Storage returned an ambiguous entry")
+        name = str(entry.get("name", ""))
+        url = str(entry.get("url", ""))
+        names.add(name)
+        parsed = urllib.parse.urlsplit(url)
+        if not same_origin(url, origin):
+            foreign.add(url)
+            continue
+        paths.add(artifact_path(parsed.path.lstrip("/")))
+    return {"cache_names": sorted(names), "paths": sorted(paths), "foreign_urls": sorted(foreign)}
+
+
 def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[str, object]:
     origin = urllib.parse.urlsplit(base_url.rstrip("/") + "/")
     port_socket = socket.socket()
@@ -727,11 +824,13 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
             raise RuntimeError("Chromium did not expose a page target")
         connection = CDPConnection(str(target["webSocketDebuggerUrl"]))
         probe = RuntimeProbe(origin)
+        active_probe = probe
+        offline_mode = False
 
         attached_workers: set[str] = set()
 
         def observe(message: dict[str, object]) -> None:
-            probe.observe(message)
+            active_probe.observe(message)
             if message.get("method") != "Target.attachedToTarget":
                 return
             params = message.get("params") or {}
@@ -746,6 +845,12 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
             connection.command("Log.enable", session_id=session_id)
             connection.command("Network.enable", session_id=session_id)
             connection.command("Runtime.runIfWaitingForDebugger", session_id=session_id)
+            if offline_mode:
+                connection.command(
+                    "Network.emulateNetworkConditions",
+                    {"offline": True, "latency": 0, "downloadThroughput": -1, "uploadThroughput": -1},
+                    session_id=session_id,
+                )
 
         connection.event_handler = observe
         connection.command("Network.enable")
@@ -772,6 +877,18 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
                         return True
             return loaded
 
+        def emulate_network(offline: bool) -> None:
+            params = {
+                "offline": offline,
+                "latency": 0,
+                "downloadThroughput": -1,
+                "uploadThroughput": -1,
+            }
+            connection.command("Network.emulateNetworkConditions", params)
+            for session_id in tuple(attached_workers):
+                with contextlib.suppress(RuntimeError):
+                    connection.command("Network.emulateNetworkConditions", params, session_id=session_id)
+
         for route in ROUTES:
             probe.begin_route(route)
             target_url = urllib.parse.urljoin(base_url.rstrip("/") + "/", route)
@@ -791,6 +908,52 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
             if not isinstance(title, str) or expected_title not in title:
                 probe._add("page_errors", f"unexpected document title: {title!r}")
             probe.finish_route()
+
+        cache_storage: dict[str, object] = {"cache_names": [], "paths": [], "foreign_urls": []}
+        offline_routes: list[dict[str, object]] = []
+        if precache_paths is not None:
+            cache_storage = browser_cache_storage(connection, origin)
+            foreign_urls = [str(url) for url in cache_storage.get("foreign_urls", [])]
+            if foreign_urls:
+                raise AssertionError("service-worker Cache Storage contains cross-origin entries: " + ", ".join(foreign_urls))
+            cached_paths = {str(path) for path in cache_storage.get("paths", [])}
+            missing_cached_paths = sorted(precache_paths - cached_paths)
+            if missing_cached_paths:
+                raise AssertionError(
+                    "installed service-worker Cache Storage misses declared precache resources: "
+                    + ", ".join(missing_cached_paths)
+                )
+
+            offline_probe = RuntimeProbe(origin)
+            active_probe = offline_probe
+            offline_mode = True
+            try:
+                emulate_network(True)
+                for route in ROUTES:
+                    offline_probe.begin_route(route)
+                    target_url = urllib.parse.urljoin(base_url.rstrip("/") + "/", route)
+                    navigation = connection.command("Page.navigate", {"url": target_url})
+                    if (navigation.get("result") or {}).get("errorText"):
+                        offline_probe._add("failed_requests", str((navigation.get("result") or {}).get("errorText")))
+                    loaded = receive_until(time.monotonic() + OFFLINE_RELOAD_TIMEOUT_SECONDS, load=True)
+                    if not loaded:
+                        offline_probe._add("page_errors", "offline reload timeout")
+                    offline_probe.finish_route()
+            finally:
+                emulate_network(False)
+                offline_mode = False
+                active_probe = probe
+            for route in offline_probe.routes:
+                offline_routes.append({
+                    "route": route["route"],
+                    "document_status": route.get("document_status"),
+                    "loaded": not any(route.get(key) for key in ("failed_requests", "page_errors", "console_errors", "log_errors", "cross_origin_requests")),
+                })
+                if route.get("document_status") != 200:
+                    raise AssertionError(f"offline reload {route['route']} status={route.get('document_status')}")
+                for key in ("failed_requests", "console_errors", "page_errors", "log_errors", "cross_origin_requests"):
+                    if route.get(key):
+                        raise AssertionError(f"offline reload {route['route']} {key}: {route[key]}")
 
         errors: list[str] = []
         for route in probe.routes:
@@ -816,6 +979,9 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
             "observation_contract": RUNTIME_OBSERVATION_CONTRACT,
             "observation_window_seconds": RUNTIME_OBSERVATION_WINDOW_SECONDS,
             "observed_offline_resources": observed_offline_resources,
+            "cache_storage": cache_storage,
+            "offline_reload_contract": OFFLINE_RELOAD_CONTRACT if precache_paths is not None else None,
+            "offline_routes": offline_routes,
             "routes": probe.routes,
             "status": "PASS",
         }

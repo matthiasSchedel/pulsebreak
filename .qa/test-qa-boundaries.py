@@ -93,7 +93,19 @@ def write_fixture(
     (root / "registerSW.js").write_text("navigator.serviceWorker.register('./sw.js');\n")
     if sw is None:
         sw = (
-            'const precacheAndRoute=()=>{};precacheAndRoute(['
+            'const precacheAndRoute=entries=>{'
+            'const cacheName="fixture-precache";'
+            'self.addEventListener("install",event=>event.waitUntil('
+            'caches.open(cacheName).then(cache=>cache.addAll(entries.map(entry=>new URL(entry.url,self.location).href)))'
+            '.then(()=>self.skipWaiting())));'
+            'self.addEventListener("activate",event=>event.waitUntil(self.clients.claim()));'
+            'self.addEventListener("fetch",event=>event.respondWith((async()=>{'
+            'const requestURL=new URL(event.request.url);'
+            'const candidates=[event.request];'
+            'if(requestURL.pathname.endsWith("/"))candidates.push(new Request(new URL(requestURL.pathname+"index.html",requestURL)));'
+            'const cache=await caches.open(cacheName);'
+            'for(const request of candidates){const hit=await cache.match(request);if(hit)return hit;}'
+            'return fetch(event.request);})()));};precacheAndRoute(['
             '{url:"registerSW.js",revision:null},'
             '{url:"manifest.webmanifest",revision:null},'
             '{url:"index.html",revision:null},'
@@ -117,7 +129,37 @@ def add_precache_entry(root: pathlib.Path, path: str) -> None:
     (root / "sw.js").write_text(sw.replace("]);", f',{{url:"{path}",revision:null}}]);'))
 
 
+FULL_FIXTURE_PRECACHE = (
+    '{url:"registerSW.js",revision:null},'
+    '{url:"manifest.webmanifest",revision:null},'
+    '{url:"index.html",revision:null},'
+    '{url:"icon.svg",revision:null},'
+    '{url:"support/index.html",revision:null},'
+    '{url:"privacy/index.html",revision:null},'
+    '{url:"style.css",revision:null},'
+    '{url:"app.js",revision:null}'
+)
+
+
+def fixture_precache_worker(body: str) -> str:
+    return f"const precacheAndRoute=()=>{{}};{body}"
+
+
 class QABoundaryTests(unittest.TestCase):
+    def test_current_production_artifact_passes_static_and_browser(self) -> None:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
+            stdout=subprocess.PIPE, text=True,
+        ).stdout.strip()
+        server = MarkerServer(ROOT, head)
+        try:
+            static = VERIFY.verify(server.url, head, ROOT)
+            browser = VERIFY.run_browser(server.url, set(static["precache_paths"]))
+            self.assertEqual(browser["status"], "PASS")
+            self.assertTrue(browser["offline_routes"])
+        finally:
+            server.close()
+
     def test_staging_rejects_tracked_symlink_and_stages_regular_fixture(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pulsebreak-symlink-fixture-") as temporary:
             repo = pathlib.Path(temporary)
@@ -262,6 +304,74 @@ class QABoundaryTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_static_graph_rejects_ambiguous_workbox_call_shapes(self) -> None:
+        hostile_workers = (
+            (
+                "if(false)",
+                fixture_precache_worker(
+                    f'if(false){{precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);}}'
+                    'precacheAndRoute([{url:"index.html",revision:null}]);'
+                ),
+            ),
+            (
+                "reordered multiple",
+                fixture_precache_worker(
+                    f'precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);'
+                    'precacheAndRoute([{url:"index.html",revision:null}]);'
+                ),
+            ),
+            (
+                "short circuit",
+                fixture_precache_worker(
+                    f'false&&precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);'
+                ),
+            ),
+            (
+                "only conditional",
+                fixture_precache_worker(
+                    f'if(false){{precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);}}'
+                ),
+            ),
+            (
+                "ternary sibling",
+                fixture_precache_worker(
+                    f'condition?precacheAndRoute([{FULL_FIXTURE_PRECACHE}]):precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);'
+                ),
+            ),
+        )
+        for label, sw in hostile_workers:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="pulsebreak-precache-ambiguous-hostile-") as temporary:
+                root = pathlib.Path(temporary)
+                write_fixture(root, "void 0;", sw=sw)
+                server = MarkerServer(root, "a" * 40)
+                try:
+                    with self.assertRaises(AssertionError):
+                        VERIFY.verify(server.url, "a" * 40)
+                finally:
+                    server.close()
+
+    def test_browser_rejects_declared_precache_absent_from_installed_cache(self) -> None:
+        partial_worker = (
+            'const precacheAndRoute=entries=>{'
+            'self.addEventListener("install",event=>event.waitUntil('
+            'caches.open("partial").then(cache=>cache.addAll(entries.slice(0,1).map(entry=>new URL(entry.url,self.location).href)))'
+            '.then(()=>self.skipWaiting())));'
+            'self.addEventListener("activate",event=>event.waitUntil(self.clients.claim()));'
+            '};'
+            f'precacheAndRoute([{FULL_FIXTURE_PRECACHE}]);'
+        )
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-cache-storage-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(root, "void 0;", sw=partial_worker)
+            track_fixture(root)
+            server = MarkerServer(root, "a" * 40)
+            try:
+                static = VERIFY.verify(server.url, "a" * 40, root)
+                with self.assertRaisesRegex(AssertionError, "Cache Storage"):
+                    VERIFY.run_browser(server.url, set(static["precache_paths"]))
+            finally:
+                server.close()
+
     def test_static_graph_rejects_nonrelative_manifest_controls(self) -> None:
         hostile_cases = (
             ("start_url", "data:text/html,pulsebreak"),
@@ -292,6 +402,73 @@ class QABoundaryTests(unittest.TestCase):
                         VERIFY.verify(server.url, "a" * 40)
                 finally:
                     server.close()
+
+    def test_static_graph_rejects_modern_manifest_url_controls(self) -> None:
+        hostile_cases = (
+            ("share_target.action", {"share_target": {"action": "data:text/plain,share"}}),
+            ("share_target.action root", {"share_target": {"action": "/share/"}}),
+            ("share_target.action cross-origin", {"share_target": {"action": "https://tracker.invalid/share"}}),
+            ("file_handlers action", {"file_handlers": [{"action": "//tracker.invalid/open"}]}),
+            ("file_handlers data action", {"file_handlers": [{"action": "data:text/plain,open"}]}),
+            ("scope_extensions origin", {"scope_extensions": [{"origin": "https://tracker.invalid"}]}),
+            ("shortcuts url", {"shortcuts": [{"url": "/support/"}]}),
+            ("protocol handler url", {"protocol_handlers": [{"url": "https://tracker.invalid/?url=%s"}]}),
+            ("note taking URL", {"note_taking": {"new_note_url": "blob:https://tracker.invalid/note"}}),
+        )
+        for label, additions in hostile_cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="pulsebreak-manifest-controls-hostile-") as temporary:
+                root = pathlib.Path(temporary)
+                write_fixture(root, "void 0;")
+                manifest = {
+                    "name": "Pulsebreak",
+                    "start_url": "./",
+                    "scope": "./",
+                    "icons": [{"src": "./icon.svg"}],
+                }
+                manifest.update(additions)
+                (root / "manifest.webmanifest").write_text(json.dumps(manifest) + "\n")
+                server = MarkerServer(root, "a" * 40)
+                try:
+                    with self.assertRaises(AssertionError):
+                        VERIFY.verify(server.url, "a" * 40)
+                finally:
+                    server.close()
+
+    def test_static_graph_accepts_valid_modern_manifest_url_controls(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-manifest-controls-positive-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(root, "void 0;")
+            (root / "share/index.html").parent.mkdir()
+            (root / "share/index.html").write_text("share\n")
+            (root / "open/index.html").parent.mkdir()
+            (root / "open/index.html").write_text("open\n")
+            (root / "handle").write_text("handle\n")
+            (root / "new/index.html").parent.mkdir()
+            (root / "new/index.html").write_text("new\n")
+            (root / "manifest.webmanifest").write_text(json.dumps({
+                "name": "Pulsebreak",
+                "start_url": "./",
+                "scope": "./",
+                "id": "./",
+                "icons": [{"src": "./icon.svg"}],
+                "screenshots": [{"src": "./icon.svg"}],
+                "shortcuts": [{"url": "./support/"}],
+                "share_target": {"action": "./share/"},
+                "file_handlers": [{"action": "./open/"}],
+                "scope_extensions": [{"origin": "./"}],
+                "protocol_handlers": [{"url": "./handle?url=%s"}],
+                "note_taking": {"new_note_url": "./new/"},
+                "tab_strip": {"new_tab_button": {"url": "./support/"}},
+            }) + "\n")
+            for path in ("share/index.html", "open/index.html", "handle", "new/index.html"):
+                add_precache_entry(root, path)
+            server = MarkerServer(root, "a" * 40)
+            try:
+                assertions = VERIFY.verify(server.url, "a" * 40)
+                self.assertIn("share/index.html", assertions["offline_graph"])
+                self.assertIn("open/index.html", assertions["offline_graph"])
+            finally:
+                server.close()
 
     def test_browser_rejects_loaded_runtime_exception(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-hostile-") as temporary:
