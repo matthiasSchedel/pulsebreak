@@ -1,0 +1,28 @@
+{
+  "schema": "preview-adapter/v2",
+  "command": ["./.qa/preview-adapter.py"],
+  "journeys_document": ".qa/user-journeys.md",
+  "backends": ["local-slot"],
+  "journeys": [
+    {
+      "name": "public-listing-routes",
+      "path_globs": [
+        ".github/workflows/ci.yml",
+        ".qa/**",
+        ".nojekyll",
+        "README.md",
+        "assets/**",
+        "icon*.svg",
+        "index.html",
+        "launch.svg",
+        "legal.css",
+        "manifest.webmanifest",
+        "privacy/**",
+        "registerSW.js",
+        "support/**",
+        "sw.js",
+        "workbox-*.js"
+      ]
+    }
+  ]
+}
