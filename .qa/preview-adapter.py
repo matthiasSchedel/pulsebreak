@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import http.server
 import json
 import os
@@ -13,6 +14,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,7 +46,12 @@ def exact_clean_head(head: str) -> None:
 
 
 def state_path(head: str) -> pathlib.Path:
-    return pathlib.Path(tempfile.gettempdir()) / f"pulsebreak-pages-preview-{head}.json"
+    namespace = hashlib.sha256(f"{REPO.resolve()}\0{head}".encode()).hexdigest()[:24]
+    return pathlib.Path(tempfile.gettempdir()) / f"pulsebreak-pages-preview-{namespace}.json"
+
+
+def state_namespace(head: str) -> str:
+    return hashlib.sha256(f"{REPO.resolve()}\0{head}".encode()).hexdigest()
 
 
 def marker_url(port: int) -> str:
@@ -77,7 +84,7 @@ def read_state(head: str) -> dict[str, object] | None:
 
 
 def choose_port(head: str) -> int:
-    start = 43_000 + (int(head[:6], 16) % 1_000)
+    start = 43_000 + (int(state_namespace(head)[:8], 16) % 1_000)
     for offset in range(80):
         port = 43_000 + ((start - 43_000 + offset) % 1_000)
         with socket.socket() as probe:
@@ -90,16 +97,49 @@ def choose_port(head: str) -> int:
 
 
 def stage_site(head: str) -> pathlib.Path:
+    tracked = []
+    for record in git("ls-files", "--stage", "-z").split("\0"):
+        if not record:
+            continue
+        metadata, relative = record.split("\t", 1)
+        mode, _blob, stage = metadata.split()
+        if stage != "0" or mode not in {"100644", "100755"}:
+            raise RuntimeError(f"tracked path has unsupported Git mode: {relative} ({mode})")
+        tracked.append(relative)
+    checkout = REPO.resolve()
+    for relative in tracked:
+        source = REPO / relative
+        component = REPO
+        for part in pathlib.PurePosixPath(relative).parts:
+            component /= part
+            if stat.S_ISLNK(component.lstat().st_mode):
+                raise RuntimeError(f"tracked path contains a symlink component: {relative}")
+        source_stat = source.lstat()
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise RuntimeError(f"tracked path is not a regular file: {relative}")
+        resolved = source.resolve(strict=True)
+        try:
+            resolved.relative_to(checkout)
+        except ValueError as error:
+            raise RuntimeError(f"tracked path escapes checkout: {relative}") from error
     root = pathlib.Path(tempfile.mkdtemp(prefix=f"pulsebreak-pages-{head[:12]}-"))
     slot = root / "site"
     slot.mkdir()
-    for relative in git("ls-files").splitlines():
+    for relative in tracked:
+        source = REPO / relative
         if relative.startswith((".github/", ".qa/")):
             continue
-        source = REPO / relative
+        source_stat = source.lstat()
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise RuntimeError(f"tracked path changed type while staging: {relative}")
+        resolved = source.resolve(strict=True)
+        try:
+            resolved.relative_to(checkout)
+        except ValueError as error:
+            raise RuntimeError(f"tracked path escaped checkout while staging: {relative}") from error
         target = slot / relative
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
+        shutil.copy2(resolved, target, follow_symlinks=False)
     if not (slot / "index.html").is_file():
         raise RuntimeError("staged preview lacks index.html")
     return slot
