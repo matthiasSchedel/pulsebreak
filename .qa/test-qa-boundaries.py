@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import importlib.util
+import json
 import pathlib
 import shutil
 import subprocess
@@ -109,6 +110,11 @@ def write_fixture(
 def track_fixture(root: pathlib.Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True)
     subprocess.run(["git", "add", "."], cwd=root, check=True)
+
+
+def add_precache_entry(root: pathlib.Path, path: str) -> None:
+    sw = (root / "sw.js").read_text()
+    (root / "sw.js").write_text(sw.replace("]);", f',{{url:"{path}",revision:null}}]);'))
 
 
 class QABoundaryTests(unittest.TestCase):
@@ -231,6 +237,62 @@ class QABoundaryTests(unittest.TestCase):
             finally:
                 server.close()
 
+    def test_static_graph_rejects_comment_decoy_precache_entries(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-precache-comment-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(
+                root,
+                "void 0;",
+                sw=(
+                    'const precacheAndRoute=()=>{};'
+                    'precacheAndRoute([{url:"index.html",revision:null}]);'
+                    '/* {url:"registerSW.js",revision:null},'
+                    '{url:"manifest.webmanifest",revision:null},'
+                    '{url:"icon.svg",revision:null},'
+                    '{url:"support/index.html",revision:null},'
+                    '{url:"privacy/index.html",revision:null},'
+                    '{url:"style.css",revision:null},'
+                    '{url:"app.js",revision:null} */'
+                ),
+            )
+            server = MarkerServer(root, "a" * 40)
+            try:
+                with self.assertRaises(AssertionError):
+                    VERIFY.verify(server.url, "a" * 40)
+            finally:
+                server.close()
+
+    def test_static_graph_rejects_nonrelative_manifest_controls(self) -> None:
+        hostile_cases = (
+            ("start_url", "data:text/html,pulsebreak"),
+            ("start_url", "blob:https://tracker.invalid/pulsebreak"),
+            ("start_url", "//tracker.invalid/pulsebreak"),
+            ("start_url", "https://tracker.invalid/pulsebreak"),
+            ("start_url", "/support/"),
+            ("icons", "data:image/svg+xml,pulsebreak"),
+        )
+        for field, value in hostile_cases:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory(prefix="pulsebreak-manifest-hostile-") as temporary:
+                root = pathlib.Path(temporary)
+                write_fixture(root, "void 0;")
+                manifest = {
+                    "name": "Pulsebreak",
+                    "start_url": "./",
+                    "scope": "./",
+                    "icons": [{"src": "./icon.svg"}],
+                }
+                if field == "icons":
+                    manifest["icons"][0]["src"] = value
+                else:
+                    manifest[field] = value
+                (root / "manifest.webmanifest").write_text(json.dumps(manifest) + "\n")
+                server = MarkerServer(root, "a" * 40)
+                try:
+                    with self.assertRaises(AssertionError):
+                        VERIFY.verify(server.url, "a" * 40)
+                finally:
+                    server.close()
+
     def test_browser_rejects_loaded_runtime_exception(self) -> None:
         with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-hostile-") as temporary:
             root = pathlib.Path(temporary)
@@ -279,6 +341,43 @@ class QABoundaryTests(unittest.TestCase):
                 VERIFY.verify(server.url, "a" * 40)
                 with self.assertRaises(AssertionError):
                     VERIFY.run_browser(server.url)
+            finally:
+                server.close()
+
+    def test_browser_rejects_delayed_same_origin_resource_missing_precache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-offline-hostile-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(
+                root,
+                "setTimeout(() => fetch(new Request(location.protocol + '//' + location.host + '/late.json')), 1200);\n",
+            )
+            (root / "late.json").write_text('{"late":true}\n')
+            track_fixture(root)
+            server = MarkerServer(root, "a" * 40)
+            try:
+                static = VERIFY.verify(server.url, "a" * 40, root)
+                with self.assertRaises(AssertionError):
+                    VERIFY.run_browser(server.url, set(static["precache_paths"]))
+            finally:
+                server.close()
+
+    def test_browser_accepts_delayed_same_origin_resource_in_precache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="pulsebreak-runtime-offline-positive-") as temporary:
+            root = pathlib.Path(temporary)
+            write_fixture(
+                root,
+                "setTimeout(() => fetch(new Request(location.protocol + '//' + location.host + '/late.json')), 1200);\n",
+            )
+            (root / "late.json").write_text('{"late":true}\n')
+            add_precache_entry(root, "late.json")
+            track_fixture(root)
+            server = MarkerServer(root, "a" * 40)
+            try:
+                static = VERIFY.verify(server.url, "a" * 40, root)
+                browser = VERIFY.run_browser(server.url, set(static["precache_paths"]))
+                VERIFY.merge_browser_offline_graph(static, browser)
+                self.assertIn("late.json", browser["observed_offline_resources"])
+                self.assertIn("late.json", static["offline_graph"])
             finally:
                 server.close()
 

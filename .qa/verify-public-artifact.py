@@ -30,7 +30,6 @@ import urllib.request
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 CSS_URL = re.compile(r"url\(\s*([\"']?)([^\"')]+?)\1\s*\)", re.IGNORECASE)
-PRECACHE_ENTRY = re.compile(r"\{url:\"([^\"]+)\",revision:(null|\"([^\"]+)\")\}")
 SOURCE_MAPPING_DIRECTIVE = re.compile(rb"(?i)sourceMappingURL\s*[:=]")
 JS_REFERENCE_PATTERNS = (
     ("runtime", re.compile(r"\b(?:fetch|importScripts|import|sendBeacon|register)\s*\(\s*([\"'`])([^\"'`]+)\1")),
@@ -101,6 +100,13 @@ def reference_boundary_error(reference: str, tag: str) -> str | None:
     return None
 
 
+def manifest_reference_boundary_error(reference: str) -> str | None:
+    """Manifest-controlled URLs must name local relative artifact resources."""
+    if reference.startswith("#"):
+        return f"non-relative manifest reference: {reference}"
+    return reference_boundary_error(reference, "manifest")
+
+
 def artifact_path(relative: str) -> str:
     """Map a fetched route to the published file covered by precache."""
     path = relative.strip("/")
@@ -109,6 +115,17 @@ def artifact_path(relative: str) -> str:
     if relative.endswith("/"):
         return f"{path}/index.html"
     return path
+
+
+def browser_resource_path(url: str, origin: urllib.parse.SplitResult) -> str | None:
+    """Normalize a successful same-origin browser response to its artifact path."""
+    if not same_origin(url, origin):
+        return None
+    path = urllib.parse.urlsplit(url).path.lstrip("/")
+    normalized = artifact_path(path)
+    if normalized == ".__pulsebreak_qa_head" or is_worker_bootstrap(normalized):
+        return None
+    return normalized
 
 
 def tracked_public_tree_failures(repo: pathlib.Path) -> list[str]:
@@ -169,8 +186,133 @@ def css_references(text: str) -> list[str]:
     return [match.group(2).strip() for match in CSS_URL.finditer(text)]
 
 
+def javascript_tokens(text: str) -> list[tuple[str, str]]:
+    """Tokenize enough JavaScript to isolate executable precache call data.
+
+    Strings are opaque, while line and block comments are discarded before
+    token matching. This prevents entry-shaped comment text from becoming an
+    effective Workbox precache entry without downloading a parser dependency.
+    """
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        character = text[index]
+        if character.isspace():
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        if character in "'\"`":
+            quote = character
+            index += 1
+            value: list[str] = []
+            while index < length:
+                character = text[index]
+                if character == quote:
+                    index += 1
+                    break
+                if character == "\\" and index + 1 < length:
+                    index += 1
+                    escaped = text[index]
+                    escapes = {"n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+                    if escaped == "u" and index + 4 < length:
+                        digits = text[index + 1:index + 5]
+                        if re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                            value.append(chr(int(digits, 16)))
+                            index += 5
+                            continue
+                    value.append(escapes.get(escaped, escaped))
+                    index += 1
+                    continue
+                value.append(character)
+                index += 1
+            tokens.append(("string", "".join(value)))
+            continue
+        if character.isalpha() or character in "_$":
+            end = index + 1
+            while end < length and (text[end].isalnum() or text[end] in "_$"):
+                end += 1
+            tokens.append(("identifier", text[index:end]))
+            index = end
+            continue
+        if character.isdigit():
+            end = index + 1
+            while end < length and (text[end].isalnum() or text[end] in "._"):
+                end += 1
+            tokens.append(("number", text[index:end]))
+            index = end
+            continue
+        tokens.append(("punctuation", character))
+        index += 1
+    return tokens
+
+
+def matching_token(tokens: list[tuple[str, str]], start: int, opening: str, closing: str) -> int | None:
+    depth = 0
+    for index in range(start, len(tokens)):
+        value = tokens[index][1]
+        if value == opening:
+            depth += 1
+        elif value == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def object_properties(tokens: list[tuple[str, str]], start: int, end: int) -> dict[str, tuple[str, str]]:
+    properties: dict[str, tuple[str, str]] = {}
+    depth = 0
+    index = start + 1
+    while index < end:
+        kind, value = tokens[index]
+        if depth == 0 and kind in {"identifier", "string"} and index + 2 < end and tokens[index + 1][1] == ":":
+            properties[value] = tokens[index + 2]
+        if value in "[{(":
+            depth += 1
+        elif value in "]})":
+            depth = max(0, depth - 1)
+        index += 1
+    return properties
+
+
 def precache_entries(text: str) -> list[tuple[str, str | None]]:
-    return [(match.group(1), None if match.group(2) == "null" else match.group(3)) for match in PRECACHE_ENTRY.finditer(text)]
+    """Extract entries from the executable precacheAndRoute array only."""
+    tokens = javascript_tokens(text)
+    for index in range(len(tokens) - 2):
+        if tokens[index] != ("identifier", "precacheAndRoute") or tokens[index + 1][1] != "(":
+            continue
+        array_start = index + 2
+        if tokens[array_start][1] != "[":
+            continue
+        array_end = matching_token(tokens, array_start, "[", "]")
+        if array_end is None:
+            return []
+        entries: list[tuple[str, str | None]] = []
+        cursor = array_start + 1
+        while cursor < array_end:
+            if tokens[cursor][1] != "{":
+                cursor += 1
+                continue
+            object_end = matching_token(tokens, cursor, "{", "}")
+            if object_end is None or object_end > array_end:
+                return []
+            properties = object_properties(tokens, cursor, object_end)
+            url = properties.get("url")
+            revision = properties.get("revision")
+            if url and url[0] == "string":
+                revision_value = revision[1] if revision and revision[0] == "string" else None
+                entries.append((url[1], revision_value))
+            cursor = object_end + 1
+        return entries
+    return []
 
 
 def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[str, object]:
@@ -223,9 +365,9 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
                     references.extend(("manifest", reference) for reference in manifest_references(manifest))
 
         for tag, reference in references:
-            if ignorable_reference(reference):
+            if tag != "manifest" and ignorable_reference(reference):
                 continue
-            boundary_error = reference_boundary_error(reference, tag)
+            boundary_error = manifest_reference_boundary_error(reference) if tag == "manifest" else reference_boundary_error(reference, tag)
             if boundary_error:
                 failures.append(boundary_error)
                 continue
@@ -272,7 +414,7 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
                 failures.append(f"cross-origin precache reference: {reference}")
                 continue
             target_parts = urllib.parse.urlsplit(target)
-            target_relative = target_parts.path.lstrip("/")
+            target_relative = artifact_path(target_parts.path.lstrip("/"))
             precached_paths.add(target_relative)
             try:
                 status, body, _content_type = fetch(target)
@@ -304,6 +446,7 @@ def verify(base_url: str, head: str, repo: pathlib.Path | None = None) -> dict[s
             for path in checked
             if path != ".__pulsebreak_qa_head" and not is_worker_bootstrap(path)
         ),
+        "precache_paths": sorted(precached_paths),
         "worker_bootstrap_invariant": WORKER_BOOTSTRAP_INVARIANT,
         "cross_origin_dependencies": [],
     }
@@ -448,6 +591,7 @@ class RuntimeProbe:
         self.origin = origin
         self.current_route = ""
         self.request_urls: dict[str, str] = {}
+        self.observed_resources: set[str] = set()
         self.route: dict[str, object] = {}
         self.routes: list[dict[str, object]] = []
 
@@ -461,6 +605,7 @@ class RuntimeProbe:
             "page_errors": [],
             "log_errors": [],
             "cross_origin_requests": [],
+            "same_origin_resources": [],
         }
 
     def _add(self, key: str, value: str) -> None:
@@ -484,6 +629,11 @@ class RuntimeProbe:
             status = int(response.get("status", 0) or 0)
             if status >= 400:
                 self._add("failed_requests", f"{url} status={status}")
+            if 200 <= status < 400:
+                resource_path = browser_resource_path(url, self.origin)
+                if resource_path:
+                    self._add("same_origin_resources", resource_path)
+                    self.observed_resources.add(resource_path)
             if params.get("type") == "Document":
                 self.route["document_status"] = status
         elif method == "Network.loadingFailed":
@@ -533,7 +683,7 @@ def browser_json(port: int, path: str) -> object:
         return json.loads(response.read().decode())
 
 
-def run_browser(base_url: str) -> dict[str, object]:
+def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[str, object]:
     origin = urllib.parse.urlsplit(base_url.rstrip("/") + "/")
     port_socket = socket.socket()
     port_socket.bind(("127.0.0.1", 0))
@@ -652,11 +802,20 @@ def run_browser(base_url: str) -> dict[str, object]:
                     errors.append(f"{route_name} {key}: {detail}")
         if errors:
             raise AssertionError("; ".join(errors))
+        observed_offline_resources = sorted(probe.observed_resources)
+        if precache_paths is not None:
+            missing_runtime_resources = sorted(set(observed_offline_resources) - precache_paths)
+            if missing_runtime_resources:
+                raise AssertionError(
+                    "browser-observed same-origin resources missing from service-worker precache: "
+                    + ", ".join(missing_runtime_resources)
+                )
         return {
             "engine": pathlib.Path(chrome_binary()).name,
             "origin": f"{origin.scheme}://{origin.netloc}",
             "observation_contract": RUNTIME_OBSERVATION_CONTRACT,
             "observation_window_seconds": RUNTIME_OBSERVATION_WINDOW_SECONDS,
+            "observed_offline_resources": observed_offline_resources,
             "routes": probe.routes,
             "status": "PASS",
         }
@@ -672,6 +831,24 @@ def run_browser(base_url: str) -> dict[str, object]:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
         shutil.rmtree(profile, ignore_errors=True)
+
+
+def merge_browser_offline_graph(
+    assertions: dict[str, object], browser: dict[str, object]
+) -> dict[str, object]:
+    """Union successful browser resources into the required offline graph."""
+    observed_resources = {str(path) for path in browser.get("observed_offline_resources", [])}
+    precache_paths = {str(path) for path in assertions.get("precache_paths", [])}
+    missing_runtime_resources = sorted(observed_resources - precache_paths)
+    if missing_runtime_resources:
+        raise AssertionError(
+            "browser-observed same-origin resources missing from service-worker precache: "
+            + ", ".join(missing_runtime_resources)
+        )
+    assertions["offline_graph"] = sorted(
+        {str(path) for path in assertions.get("offline_graph", [])} | observed_resources
+    )
+    return assertions
 
 
 def main() -> int:
@@ -707,7 +884,9 @@ def main() -> int:
             artifact_dir.resolve().mkdir(parents=True, exist_ok=True)
         try:
             assertions = verify(preview_url, head, repo)
-            browser = run_browser(preview_url)
+            precache_paths = {str(path) for path in assertions.get("precache_paths", [])}
+            browser = run_browser(preview_url, precache_paths)
+            merge_browser_offline_graph(assertions, browser)
             assertions["browser"] = browser
         finally:
             if server is not None:
