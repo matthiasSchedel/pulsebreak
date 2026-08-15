@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Callable
 
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -54,6 +55,12 @@ RUNTIME_OBSERVATION_CONTRACT = "bounded-post-load-async-window-v1"
 RUNTIME_OBSERVATION_WINDOW_SECONDS = 2.0
 OFFLINE_RELOAD_CONTRACT = "installed-cache-storage-offline-reload-v1"
 OFFLINE_RELOAD_TIMEOUT_SECONDS = 8.0
+CDP_CONNECT_TIMEOUT_SECONDS = 20.0
+CDP_COMMAND_TIMEOUT_SECONDS = 20.0
+CDP_CACHE_STORAGE_DEADLINE_SECONDS = 30.0
+CDP_COMMAND_RETRY_ATTEMPTS = 2
+CDP_TARGET_DISCOVERY_TIMEOUT_SECONDS = 30.0
+CDP_TARGET_POLL_SECONDS = 0.1
 
 # These scripts bootstrap the worker itself. They are fetched by the browser
 # during worker installation and are intentionally excluded from the offline
@@ -541,7 +548,9 @@ class CDPConnection:
         parsed = urllib.parse.urlsplit(websocket_url)
         if parsed.scheme != "ws" or not parsed.hostname or not parsed.port:
             raise RuntimeError("Chromium returned an invalid CDP WebSocket URL")
-        self.socket = socket.create_connection((parsed.hostname, parsed.port), timeout=8)
+        self.socket = socket.create_connection(
+            (parsed.hostname, parsed.port), timeout=CDP_CONNECT_TIMEOUT_SECONDS
+        )
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
             f"GET {parsed.path or '/'} HTTP/1.1\r\n"
@@ -553,8 +562,16 @@ class CDPConnection:
         ).encode()
         self.socket.sendall(request)
         response = b""
+        handshake_deadline = time.monotonic() + CDP_CONNECT_TIMEOUT_SECONDS
         while b"\r\n\r\n" not in response:
-            chunk = self.socket.recv(4096)
+            remaining = handshake_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Chromium CDP handshake timed out")
+            self.socket.settimeout(remaining)
+            try:
+                chunk = self.socket.recv(4096)
+            except socket.timeout as error:
+                raise RuntimeError("Chromium CDP handshake timed out") from error
             if not chunk:
                 raise RuntimeError("Chromium closed the CDP handshake")
             response += chunk
@@ -562,6 +579,7 @@ class CDPConnection:
             raise RuntimeError("Chromium rejected the CDP WebSocket handshake")
         self.next_id = 0
         self.event_handler = None
+        self.pending: dict[int, dict[str, object]] = {}
 
     def close(self) -> None:
         with contextlib.suppress(OSError):
@@ -624,21 +642,43 @@ class CDPConnection:
         method: str,
         params: dict[str, object] | None = None,
         session_id: str | None = None,
+        timeout: float | None = None,
     ) -> dict[str, object]:
         self.next_id += 1
         command_id = self.next_id
         command: dict[str, object] = {"id": command_id, "method": method, "params": params or {}}
         if session_id:
             command["sessionId"] = session_id
-        self._send_frame(json.dumps(command).encode())
-        while True:
-            message = self.receive()
-            if message.get("id") == command_id:
-                if "error" in message:
-                    raise RuntimeError(f"CDP {method} failed: {message['error']}")
-                return message
-            if self.event_handler:
-                self.event_handler(message)
+        command_deadline = time.monotonic() + (timeout or CDP_COMMAND_TIMEOUT_SECONDS)
+        previous_timeout = self.socket.gettimeout()
+        try:
+            self.socket.settimeout(max(0.05, command_deadline - time.monotonic()))
+            self._send_frame(json.dumps(command).encode())
+            while True:
+                pending = self.pending.pop(command_id, None)
+                if pending is not None:
+                    message = pending
+                else:
+                    remaining = command_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(f"CDP {method} command {command_id} timed out")
+                    self.socket.settimeout(max(0.05, remaining))
+                    try:
+                        message = self.receive()
+                    except socket.timeout as error:
+                        raise RuntimeError(f"CDP {method} command {command_id} timed out") from error
+                if message.get("id") == command_id:
+                    if "error" in message:
+                        raise RuntimeError(f"CDP {method} failed: {message['error']}")
+                    return message
+                message_id = message.get("id")
+                if isinstance(message_id, int):
+                    self.pending[message_id] = message
+                    continue
+                if self.event_handler:
+                    self.event_handler(message)
+        finally:
+            self.socket.settimeout(previous_timeout)
 
 
 class RuntimeProbe:
@@ -733,9 +773,69 @@ def chrome_binary() -> str:
     raise RuntimeError("installed Chromium executable not found")
 
 
-def browser_json(port: int, path: str) -> object:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=1) as response:
+def browser_json(port: int, path: str, timeout: float = 2.0) -> object:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as response:
         return json.loads(response.read().decode())
+
+
+def discover_page_target(
+    port: int,
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float = CDP_TARGET_DISCOVERY_TIMEOUT_SECONDS,
+    poll_interval: float = CDP_TARGET_POLL_SECONDS,
+    reader: Callable[[int, str], object] = browser_json,
+) -> dict[str, object]:
+    """Find a page target under a bounded, retrying startup deadline."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Chromium exited before exposing a page target")
+        try:
+            targets = reader(port, "/json/list")
+        except (OSError, ValueError, urllib.error.URLError):
+            targets = []
+        for candidate in targets if isinstance(targets, list) else []:
+            if candidate.get("type") == "page" and candidate.get("webSocketDebuggerUrl"):
+                return candidate
+        remaining = deadline - time.monotonic()
+        if remaining > 0 and poll_interval > 0:
+            time.sleep(min(poll_interval, remaining))
+    raise RuntimeError(
+        f"Chromium did not expose a page target within {timeout:.1f}s"
+    )
+
+
+def cdp_command_with_retry(
+    connection: CDPConnection,
+    method: str,
+    params: dict[str, object] | None = None,
+    *,
+    session_id: str | None = None,
+    attempts: int = CDP_COMMAND_RETRY_ATTEMPTS,
+    deadline_seconds: float = CDP_CACHE_STORAGE_DEADLINE_SECONDS,
+) -> dict[str, object]:
+    """Retry only bounded CDP timeouts while preserving command identity."""
+    deadline = time.monotonic() + deadline_seconds
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return connection.command(
+                method,
+                params,
+                session_id=session_id,
+                timeout=min(CDP_COMMAND_TIMEOUT_SECONDS, remaining),
+            )
+        except (RuntimeError, socket.timeout) as error:
+            last_error = error
+            if "timed out" not in str(error).lower() or attempt + 1 >= attempts:
+                raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"CDP {method} retry deadline expired")
 
 
 def browser_cache_storage(connection: CDPConnection, origin: urllib.parse.SplitResult) -> dict[str, object]:
@@ -753,9 +853,11 @@ def browser_cache_storage(connection: CDPConnection, origin: urllib.parse.SplitR
       }
       return entries;
     })()"""
-    evaluation = connection.command(
+    evaluation = cdp_command_with_retry(
+        connection,
         "Runtime.evaluate",
         {"expression": expression, "awaitPromise": True, "returnByValue": True},
+        deadline_seconds=CDP_CACHE_STORAGE_DEADLINE_SECONDS,
     )
     result = (evaluation.get("result") or {}).get("result") or {}
     if "exceptionDetails" in evaluation.get("result", {}):
@@ -804,24 +906,7 @@ def run_browser(base_url: str, precache_paths: set[str] | None = None) -> dict[s
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        target: dict[str, object] | None = None
-        for _ in range(100):
-            if process.poll() is not None:
-                raise RuntimeError("Chromium exited before opening CDP")
-            try:
-                targets = browser_json(browser_port, "/json/list")
-            except (OSError, ValueError, urllib.error.URLError):
-                time.sleep(0.1)
-                continue
-            for candidate in targets if isinstance(targets, list) else []:
-                if candidate.get("type") == "page" and candidate.get("webSocketDebuggerUrl"):
-                    target = candidate
-                    break
-            if target:
-                break
-            time.sleep(0.1)
-        if not target:
-            raise RuntimeError("Chromium did not expose a page target")
+        target = discover_page_target(browser_port, process)
         connection = CDPConnection(str(target["webSocketDebuggerUrl"]))
         probe = RuntimeProbe(origin)
         active_probe = probe

@@ -146,6 +146,58 @@ def fixture_precache_worker(body: str) -> str:
 
 
 class QABoundaryTests(unittest.TestCase):
+    def test_cdp_target_discovery_retries_delayed_page_target(self) -> None:
+        class RunningProcess:
+            def poll(self) -> None:
+                return None
+
+        calls = 0
+
+        def delayed_reader(_port: int, _path: str) -> list[dict[str, str]]:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return []
+            return [{"type": "page", "webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/page"}]
+
+        target = VERIFY.discover_page_target(
+            1234,
+            RunningProcess(),
+            timeout=0.1,
+            poll_interval=0,
+            reader=delayed_reader,
+        )
+        self.assertEqual(target["type"], "page")
+        self.assertEqual(calls, 3)
+
+    def test_cdp_runtime_evaluate_retries_delayed_response(self) -> None:
+        class DelayedEvaluate:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def command(self, _method: str, _params: dict[str, object], **_kwargs: object) -> dict[str, object]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("CDP Runtime.evaluate command 1 timed out")
+                return {
+                    "result": {
+                        "result": {
+                            "value": [{
+                                "name": "fixture-cache",
+                                "url": "http://127.0.0.1:1234/index.html",
+                            }]
+                        }
+                    }
+                }
+
+        connection = DelayedEvaluate()
+        cache = VERIFY.browser_cache_storage(
+            connection,
+            VERIFY.urllib.parse.urlsplit("http://127.0.0.1:1234/"),
+        )
+        self.assertEqual(connection.calls, 2)
+        self.assertEqual(cache["paths"], ["index.html"])
+
     def test_current_production_artifact_passes_static_and_browser(self) -> None:
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, check=True,
