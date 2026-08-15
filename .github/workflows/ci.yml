@@ -14,11 +14,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-      - name: Verify hostile QA boundaries
-        run: python3 .qa/test-qa-boundaries.py
-      - name: Verify exact public artifact
-        run: >-
-          python3 .qa/verify-public-artifact.py
-          --ci
-          --repo .
-          --head "${{ github.event.pull_request.head.sha }}"
+          fetch-depth: 0
+      - name: Verify public artifact
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -e index.html ]]; then
+            python3 .qa/test-qa-boundaries.py
+            python3 .qa/verify-public-artifact.py --ci --repo . --head "$HEAD_SHA"
+            exit 0
+          fi
+
+          base_tree="$(git ls-tree -r --name-only "$BASE_SHA")"
+          head_tree="$(git ls-tree -r --name-only "$HEAD_SHA")"
+          if [[ -n "$base_tree" || "$head_tree" != ".github/workflows/ci.yml" ]]; then
+            echo "bootstrap requires an empty base tree and exactly .github/workflows/ci.yml in the head tree" >&2
+            exit 1
+          fi
+
+          echo "verified empty-base CI bootstrap"
